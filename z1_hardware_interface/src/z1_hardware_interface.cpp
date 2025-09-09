@@ -29,6 +29,9 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/logging.hpp"
 
+// CAMBIO: includes para multithreading - JhonGonzalezR
+
+
 //  ____            _                 _   _
 // |  _ \  ___  ___| | __ _ _ __ __ _| |_(_) ___  _ __  ___
 // | | | |/ _ \/ __| |/ _` | '__/ _` | __| |/ _ \| '_ \/ __|
@@ -47,6 +50,21 @@ pretty_vector(const Iterable& vec) {
 }
 
 static std::pair<std::string, std::string> split_interface(const std::string&);
+
+// ===========================================================================
+// CAMBIO: estructuras compartidas para estado y comando
+// struct SharedState {
+//   Vec6 q; Vec6 qd; Vec6 tau;
+//   double g_q{0.0}, g_qd{0.0}, g_tau{0.0};
+// };
+
+// struct SharedCmd {
+//   Vec6 q; Vec6 qd; Vec6 tau;
+//   double g_q{0.0}, g_qd{0.0}, g_tau{0.0};
+//   std::array<double,7> kp{}, kd{};
+// };
+
+// ===========================================================================
 
 //  ____   ____ _     ____ ____  ____    _     _  __       ____           _
 // |  _ \ / ___| |   / ___|  _ \|  _ \  | |   (_)/ _| ___ / ___|   _  ___| | ___
@@ -84,7 +102,23 @@ HardwareInterface::on_configure(const rclcpp_lifecycle::State& prev_state) {
     RCLCPP_INFO(get_logger(), "Connection established!");
     _arm->sendRecvThread->start();
     _arm->setFsm(UNITREE_ARM::ArmFSMState::PASSIVE);
-    read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+    // read(rclcpp::Time(0), rclcpp::Duration(0, 0));
+
+
+    for(int i = 0; i < 5; ++i){
+        _arm->sendRecv();
+        for(int j=0;j<6;j++){
+            _arm_state.q(j)   = _arm->lowstate->q[j];
+            _arm_state.qd(j)  = _arm->lowstate->dq[j];
+            _arm_state.tau(j) = _arm->lowstate->tau[j];
+        }
+        if(with_gripper()){
+            _gripper_state.q   = _arm->lowstate->q[6];
+            _gripper_state.qd  = _arm->lowstate->dq[6];
+            _gripper_state.tau = _arm->lowstate->tau[6];
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
     // clang-format off
     RCLCPP_INFO(get_logger(), "Current joints configuration: %s", pretty_vector(_arm_state.q).c_str());
@@ -102,6 +136,34 @@ HardwareInterface::on_configure(const rclcpp_lifecycle::State& prev_state) {
     _arm->setArmCmd(_arm_state.q, _arm_state.qd);
     _arm->setFsm(UNITREE_ARM::ArmFSMState::LOWCMD);
     RCLCPP_INFO(get_logger(), "SDK switch to low-level control!");
+
+    // ===========================================================================
+  // CAMBIO: inicializar buffers
+    {
+        std::scoped_lock lk(state_mtx_, cmd_mtx_);
+        for (int i=0;i<6;++i) {
+            state_buf_.q(i)   = _arm_state.q(i);
+            state_buf_.qd(i)  = _arm_state.qd(i);
+            state_buf_.tau(i) = _arm_state.tau(i);
+            cmd_buf_.q(i)     = _arm_cmd.q(i);
+            cmd_buf_.qd(i)    = _arm_cmd.qd(i);
+            cmd_buf_.tau(i)   = _arm_cmd.tau(i);
+            cmd_buf_.kp[i]    = _current_gains.kp[i];
+            cmd_buf_.kd[i]    = _current_gains.kd[i];
+        }
+        if (with_gripper()) {
+            state_buf_.g_q   = _gripper_state.q;
+            state_buf_.g_qd  = _gripper_state.qd;
+            state_buf_.g_tau = _gripper_state.tau;
+            cmd_buf_.g_q     = _gripper_cmd.q;
+            cmd_buf_.g_qd    = _gripper_cmd.qd;
+            cmd_buf_.g_tau   = _gripper_cmd.tau;
+            cmd_buf_.kp[6]   = _current_gains.kp[6];
+            cmd_buf_.kd[6]   = _current_gains.kd[6];
+        }
+
+    // ===========================================================================
+    }
 
     RCLCPP_DEBUG(get_logger(), "on_configure() completed successfully");
     return hardware_interface::CallbackReturn::SUCCESS;
@@ -127,12 +189,30 @@ HardwareInterface::on_shutdown(const rclcpp_lifecycle::State& prev_state) {
         != hardware_interface::CallbackReturn::SUCCESS) {
         RCLCPP_ERROR(get_logger(), "parent on_shutdown() failed");
     }
-    RCLCPP_INFO(get_logger(), "Going back to start");
-    _arm->backToStart();
-    RCLCPP_INFO(get_logger(), "Setting arm into passive state");
+
+    //  Detener hilo IO de manera segura
+    io_running_.store(false);
+    if (io_thread_.joinable()) {
+        RCLCPP_INFO(get_logger(), "Waiting for IO thread to finish...");
+        io_thread_.join();
+        RCLCPP_INFO(get_logger(), "IO thread finished.");
+    }
+
+    //  Cambiar a modo PASSIVE antes de mover brazo
+    RCLCPP_INFO(get_logger(), "Setting arm into PASSIVE state");
     _arm->setFsm(UNITREE_ARM::ArmFSMState::PASSIVE);
-    RCLCPP_INFO(get_logger(), "Closing SDK connection");
-    _arm->sendRecvThread->shutdown();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // asegurar paquete recibido
+
+    //  Llevar brazo a posición inicial (home)
+    RCLCPP_INFO(get_logger(), "Returning arm to start position");
+    _arm->backToStart();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // esperar movimiento
+
+    //  Cerrar SDK de manera segura
+    RCLCPP_INFO(get_logger(), "Shutting down SDK connection");
+    if (_arm->sendRecvThread)
+        _arm->sendRecvThread->shutdown();
+
     RCLCPP_DEBUG(get_logger(), "on_shutdown() completed successfully");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -145,6 +225,11 @@ HardwareInterface::on_activate(const rclcpp_lifecycle::State& prev_state) {
         RCLCPP_ERROR(get_logger(), "parent on_shutdown() failed");
     }
     // TODO
+
+    io_running_.store(true);
+    io_thread_ = std::thread([this]{ this->ioLoop(); }); // CAMBIO: lanzar hilo IO
+
+
     RCLCPP_DEBUG(get_logger(), "on_activate() completed successfully");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -161,6 +246,11 @@ HardwareInterface::on_deactivate(const rclcpp_lifecycle::State& prev_state) {
         return hardware_interface::CallbackReturn::ERROR;
     }
     // TODO
+
+
+    stopIoThread();
+
+
     RCLCPP_DEBUG(get_logger(), "on_deactivate() completed successfully");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -237,16 +327,16 @@ HardwareInterface::export_command_interfaces() {
 hardware_interface::return_type
 HardwareInterface::
         read(const rclcpp::Time& /* time */, const rclcpp::Duration& /* period */) {
-    _arm->sendRecv();
-    for (long i = 0; i < 6; ++i) {
-        _arm_state.q(i)   = _arm->lowstate->q[i];
-        _arm_state.qd(i)  = _arm->lowstate->dq[i];
-        _arm_state.tau(i) = _arm->lowstate->tau[i];
+    std::scoped_lock lk(state_mtx_);
+    for (int i=0;i<6;++i) {
+        _arm_state.q(i)   = state_buf_.q(i);
+        _arm_state.qd(i)  = state_buf_.qd(i);
+        _arm_state.tau(i) = state_buf_.tau(i);
     }
     if (with_gripper()) {
-        _gripper_state.q   = _arm->lowstate->q[6];
-        _gripper_state.qd  = _arm->lowstate->dq[6];
-        _gripper_state.tau = _arm->lowstate->tau[6];
+        _gripper_state.q   = state_buf_.g_q;
+        _gripper_state.qd  = state_buf_.g_qd;
+        _gripper_state.tau = state_buf_.g_tau;
     }
     return hardware_interface::return_type::OK;
 }
@@ -254,10 +344,22 @@ HardwareInterface::
 hardware_interface::return_type
 HardwareInterface::
         write(const rclcpp::Time& /* time */, const rclcpp::Duration& /* period */) {
-    saturate_torque();
-    _arm->setArmCmd(_arm_cmd.q, _arm_cmd.qd, _arm_cmd.tau);
-    _arm->setGripperCmd(_gripper_cmd.q, _gripper_cmd.qd, _gripper_cmd.tau);
-    _arm->sendRecv();
+    std::scoped_lock lk(cmd_mtx_);
+    for (int i=0;i<6;++i) {
+        cmd_buf_.q(i)   = _arm_cmd.q(i);
+        cmd_buf_.qd(i)  = _arm_cmd.qd(i);
+        cmd_buf_.tau(i) = _arm_cmd.tau(i);
+    }
+    if (with_gripper()) {
+        cmd_buf_.g_q   = _gripper_cmd.q;
+        cmd_buf_.g_qd  = _gripper_cmd.qd;
+        cmd_buf_.g_tau = _gripper_cmd.tau;
+    }
+    // Gains ya deberían haber sido fijados en perform_command_mode_switch().
+    for (int i=0;i<7;++i) { cmd_buf_.kp[i]=_current_gains.kp[i]; cmd_buf_.kd[i]=_current_gains.kd[i]; }
+    cmd_seq_.fetch_add(1, std::memory_order_release);
+
+
     return hardware_interface::return_type::OK;
 }
 
@@ -276,12 +378,15 @@ HardwareInterface::perform_command_mode_switch(
         auto idx                = get_joint_id(name);
 
         if (type == HW_IF_POSITION) {
+            RCLCPP_INFO(get_logger(), "Switching control mode POSITION");
             _current_gains.kp[idx] = _default_gains.kp[idx];
             _current_gains.kd[idx] = _default_gains.kd[idx];
         } else if (type == HW_IF_VELOCITY) {
+            RCLCPP_INFO(get_logger(), "Switching control mode VELOCITY");
             _current_gains.kp[idx] = 0.0;
             _current_gains.kd[idx] = _default_gains.kd[idx];
         } else if (type == HW_IF_EFFORT) {
+            RCLCPP_INFO(get_logger(), "Switching control mode EFFORT");
             _current_gains.kp[idx] = 0.0;
             _current_gains.kd[idx] = 0.0;
         } else {
@@ -299,14 +404,35 @@ HardwareInterface::perform_command_mode_switch(
     RCLCPP_INFO(get_logger(), "Updated derivative gains: %s", pretty_vector(_current_gains.kd).c_str());
     // clang-format on
 
-    _arm->lowcmd->setControlGain(_current_gains.kp, _current_gains.kd);
-    _arm->lowcmd->setGripperGain(_current_gains.kp[6], _current_gains.kd[6]);
+    // _arm->lowcmd->setControlGain(_current_gains.kp, _current_gains.kd);
+    // _arm->lowcmd->setGripperGain(_current_gains.kp[6], _current_gains.kd[6]);
 
-    // Set command to current state
-    _arm_cmd.q      = _arm_state.q;
-    _arm_cmd.qd     = _arm_state.qd;
-    _gripper_cmd.q  = _gripper_state.q;
-    _gripper_cmd.qd = _gripper_state.qd;
+    // // Set command to current state
+    // _arm_cmd.q      = _arm_state.q;
+    // _arm_cmd.qd     = _arm_state.qd;
+    // _gripper_cmd.q  = _gripper_state.q;
+    // _gripper_cmd.qd = _gripper_state.qd;
+
+
+    // === Guardar cambios en el buffer compartido con write() ===
+    {
+        std::scoped_lock lk(cmd_mtx_);
+        for (int i = 0; i < 6; ++i) {
+            cmd_buf_.kp[i] = _current_gains.kp[i];
+            cmd_buf_.kd[i] = _current_gains.kd[i];
+            // Armar handover suave: partir del estado actual
+            cmd_buf_.q(i)  = _arm_state.q(i);
+            cmd_buf_.qd(i) = _arm_state.qd(i);
+        }
+
+        if (with_gripper()) {
+            cmd_buf_.kp[6] = _current_gains.kp[6];
+            cmd_buf_.kd[6] = _current_gains.kd[6];
+            cmd_buf_.g_q   = _gripper_state.q;
+            cmd_buf_.g_qd  = _gripper_state.qd;
+        }
+    }
+
 
     return hardware_interface::return_type::OK;
 }
@@ -345,6 +471,58 @@ HardwareInterface::get_joint_id(const std::string& joint_name) const {
             fmt::format("Unable to find joint '{}' with the joints of the robot")
     );
 }
+
+// ===========================================================================
+// CAMBIO: loop de IO en hilo dedicado
+void HardwareInterface::ioLoop() {
+  while (io_running_.load()) {
+    // 1. aplicar último comando
+    {
+      std::scoped_lock lk(cmd_mtx_);
+      Vec6 tau_sat = cmd_buf_.tau.cwiseMin(_arm_max_torque).cwiseMax(-_arm_max_torque);
+      double g_tau_sat = std::clamp(cmd_buf_.g_tau, -_gripper_max_torque, _gripper_max_torque);
+
+      _arm->lowcmd->setControlGain(
+        std::vector<double>(cmd_buf_.kp.begin(), cmd_buf_.kp.end()),
+        std::vector<double>(cmd_buf_.kd.begin(), cmd_buf_.kd.end())
+);
+
+      if (with_gripper())
+        _arm->lowcmd->setGripperGain(cmd_buf_.kp[6], cmd_buf_.kd[6]);
+
+      _arm->setArmCmd(cmd_buf_.q, cmd_buf_.qd, tau_sat);
+      if (with_gripper())
+        _arm->setGripperCmd(cmd_buf_.g_q, cmd_buf_.g_qd, g_tau_sat);
+    }
+
+    // 2. copiar estado
+    SharedState tmp;
+    for (int i=0;i<6;++i) {
+      tmp.q(i)   = _arm->lowstate->q[i];
+      tmp.qd(i)  = _arm->lowstate->dq[i];
+      tmp.tau(i) = _arm->lowstate->tau[i];
+    }
+    if (with_gripper()) {
+      tmp.g_q   = _arm->lowstate->q[6];
+      tmp.g_qd  = _arm->lowstate->dq[6];
+      tmp.g_tau = _arm->lowstate->tau[6];
+    }
+    {
+      std::scoped_lock lk(state_mtx_);
+      state_buf_ = tmp;
+    }
+  }
+}
+
+// CAMBIO: utilidades para parar hilo
+void HardwareInterface::stopIoThread() {
+  bool expected = true;
+  if (io_running_.compare_exchange_strong(expected,false)) {
+    if (io_thread_.joinable()) io_thread_.join();
+  }
+}
+
+// ===========================================================================
 
 //  ____  _        _   _
 // / ___|| |_ __ _| |_(_) ___ ___
