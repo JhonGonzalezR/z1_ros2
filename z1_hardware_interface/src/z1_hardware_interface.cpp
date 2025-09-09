@@ -29,7 +29,7 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/logging.hpp"
 
-// CAMBIO: includes para multithreading - JhonGonzalezR
+// CHANGE: multithreading - @JhonGonzalezR
 
 
 //  ____            _                 _   _
