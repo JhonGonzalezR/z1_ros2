@@ -3,21 +3,18 @@
  * Author: Matteo Dalle Vedove (matteodv99tn@gmail.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
  */
+
 #ifndef UNITREE_Z1_HW_INTERFACE_HPP__
 #define UNITREE_Z1_HW_INTERFACE_HPP__
 
 #include <Eigen/Dense>
+#include <array>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <vector>
 
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
@@ -32,7 +29,7 @@ namespace unitree::z1 {
 
 class HardwareInterface : public hardware_interface::SystemInterface {
 public:
-    using Vec6   = Eigen::Vector<double, 6>;  // NOLINT: magic number
+    using Vec6   = Eigen::Vector<double, 6>;
     using ArmPtr = std::unique_ptr<UNITREE_ARM::unitreeArm>;
 
     RCLCPP_SHARED_PTR_DEFINITIONS(HardwareInterface)
@@ -45,66 +42,57 @@ public:
     HardwareInterface& operator=(const HardwareInterface&)  = delete;
     HardwareInterface& operator=(const HardwareInterface&&) = delete;
 
-
     hardware_interface::CallbackReturn on_configure(
-            const rclcpp_lifecycle::State& prev_state
+        const rclcpp_lifecycle::State& prev_state
     ) override;
 
     hardware_interface::CallbackReturn on_cleanup(
-            const rclcpp_lifecycle::State& prev_state
+        const rclcpp_lifecycle::State& prev_state
     ) override;
 
     hardware_interface::CallbackReturn on_shutdown(
-            const rclcpp_lifecycle::State& prev_state
+        const rclcpp_lifecycle::State& prev_state
     ) override;
 
     hardware_interface::CallbackReturn on_activate(
-            const rclcpp_lifecycle::State& prev_state
+        const rclcpp_lifecycle::State& prev_state
     ) override;
 
     hardware_interface::CallbackReturn on_deactivate(
-            const rclcpp_lifecycle::State& prev_state
+        const rclcpp_lifecycle::State& prev_state
     ) override;
 
     hardware_interface::CallbackReturn on_error(
-            const rclcpp_lifecycle::State& prev_state
+        const rclcpp_lifecycle::State& prev_state
     ) override;
 
     std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
-
-    std::vector<hardware_interface::CommandInterface>
-
-    export_command_interfaces() override;
+    std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
 
     hardware_interface::return_type read(
-            const rclcpp::Time& time, const rclcpp::Duration& period
+        const rclcpp::Time& time, const rclcpp::Duration& period
     ) override;
 
     hardware_interface::return_type write(
-            const rclcpp::Time& time, const rclcpp::Duration& period
+        const rclcpp::Time& time, const rclcpp::Duration& period
     ) override;
 
     hardware_interface::return_type perform_command_mode_switch(
-            const std::vector<std::string>& start_interfaces,
-            const std::vector<std::string>& stop_interfaces
+        const std::vector<std::string>& start_interfaces,
+        const std::vector<std::string>& stop_interfaces
     ) override;
 
-    // clang-format off
     [[nodiscard]] std::vector<hardware_interface::ComponentInfo>& joints() { return info_.joints; }
     [[nodiscard]] const std::vector<hardware_interface::ComponentInfo>& joints() const { return info_.joints; }
 
     [[nodiscard]] rclcpp::Logger& get_logger() { return _logger; }
-    
     [[nodiscard]] bool with_gripper() const;
-    // clang-format on
-
 
 private:
     rclcpp::Logger _logger = rclcpp::get_logger("z1_hardware_interface");
-
     ArmPtr _arm = nullptr;
 
-    Vec6   _arm_max_torque     = 20.0 * Vec6::Ones();
+    Vec6 _arm_max_torque     = 20.0 * Vec6::Ones();
     double _gripper_max_torque = 20.0;
 
     struct GainsData {
@@ -116,34 +104,56 @@ private:
     GainsData _current_gains;
 
     struct {
-        Vec6 q   = Vec6::Zero();
-        Vec6 qd  = Vec6::Zero();
+        Vec6 q = Vec6::Zero();
+        Vec6 qd = Vec6::Zero();
         Vec6 tau = Vec6::Zero();
     } _arm_state;
 
     struct {
-        double q   = 0;
-        double qd  = 0;
+        double q = 0;
+        double qd = 0;
         double tau = 0;
     } _gripper_state;
 
     struct {
-        Vec6 q   = Vec6::Zero();
-        Vec6 qd  = Vec6::Zero();
+        Vec6 q = Vec6::Zero();
+        Vec6 qd = Vec6::Zero();
         Vec6 tau = Vec6::Zero();
     } _arm_cmd;
 
     struct {
-        double q   = 0;
-        double qd  = 0;
+        double q = 0;
+        double qd = 0;
         double tau = 0;
     } _gripper_cmd;
 
     void saturate_torque();
-
     long get_joint_id(const std::string& joint_name) const;
-};
 
+    // =======================================================================
+    // Cambios para multithreading / buffers compartidos
+    struct SharedState {
+        Vec6 q, qd, tau;
+        double g_q{0.0}, g_qd{0.0}, g_tau{0.0};
+    };
+
+    struct SharedCmd {
+        Vec6 q, qd, tau;
+        double g_q{0.0}, g_qd{0.0}, g_tau{0.0};
+        std::array<double,7> kp{}, kd{};
+    };
+
+    SharedState state_buf_;
+    SharedCmd cmd_buf_;
+    std::mutex state_mtx_;
+    std::mutex cmd_mtx_;
+    std::atomic<bool> io_running_{false};
+    std::thread io_thread_;
+    std::atomic<uint64_t> cmd_seq_{0};
+
+    void ioLoop();
+    void stopIoThread();
+};
 
 }  // namespace unitree::z1
 
