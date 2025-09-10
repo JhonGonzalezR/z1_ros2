@@ -104,6 +104,16 @@ def launch_setup(context, *args, **kwargs):
             "set_state": "active",
         }],
     )
+    gripper_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["gripper_position_controller", "-c", "/controller_manager"],
+        parameters=[{
+            "use_sim_time": use_sim_time,
+            "set_state": "active",
+        }],
+)
+
 
     rviz_node = Node(
         package="rviz2",
@@ -124,6 +134,7 @@ def launch_setup(context, *args, **kwargs):
         robot_state_publisher_node,
         joint_state_broadcaster_spawner,
         starting_controller_spawner,
+        # gripper_controller_spawner,
         rviz_delayed,
     ]
 
