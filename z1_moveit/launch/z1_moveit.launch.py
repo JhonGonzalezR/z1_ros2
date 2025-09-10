@@ -70,10 +70,18 @@ def launch_setup(context, *args, **kwargs):
         condition=IfCondition(rviz),
     )
 
+    markers_node = Node(
+            package="z1_utils",
+            executable="ee_tracker",
+            name="ee_tracker",
+            output="screen"
+        )
+
     return [
         bringup_launch,
         generate_move_group_launch(moveit_config),
         rviz_launch,
+        markers_node,
     ]
 
 
