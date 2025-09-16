@@ -112,7 +112,7 @@ def launch_setup(context, *args, **kwargs):
             "use_sim_time": use_sim_time,
             "set_state": "active",
         }],
-)
+    )
 
 
     rviz_node = Node(

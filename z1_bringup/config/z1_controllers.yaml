@@ -14,6 +14,9 @@ controller_manager:
     joint_trajectory_controller:
       type: "joint_trajectory_controller/JointTrajectoryController"
 
+    torque_inverse_dynamics_controller:
+      type: "torque_inverse_dynamics_controller/TorqueInverseDynamicsController"
+
     gripper_position_controller:
       type: position_controllers/GripperActionController
       
@@ -39,6 +42,14 @@ torque_controller:
       - joint4
       - joint5
       - joint6
+
+torque_inverse_dynamics_controller:
+  ros__parameters:
+    joints: [joint1, joint2, joint3, joint4, joint5, joint6, jointGripper]
+    Kp1_gain: 109000.0
+    Kd1_gain: 0.0
+    Kp2_gain: 0.0
+    Kd2_gain: 0.0
 
 #####################################
 # INTENTO
